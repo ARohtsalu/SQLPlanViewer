@@ -23,19 +23,43 @@ func operatorIcon(op string) string {
 	switch op {
 	case "Index Seek", "Clustered Index Seek":
 		return "🔍"
-	case "Table Scan", "Index Scan", "Clustered Index Scan":
+	case "Index Scan", "Clustered Index Scan":
 		return "📋"
-	case "Nested Loops":
-		return "↔"
+	case "Table Scan":
+		return "⚠"
 	case "Hash Match":
 		return "#"
+	case "Nested Loops":
+		return "↩"
 	case "Sort":
 		return "↕"
 	case "Table Spool", "Row Count Spool":
 		return "💾"
+	case "Table Insert", "Clustered Index Insert":
+		return "+"
+	case "Compute Scalar":
+		return "∑"
+	case "Filter":
+		return "▽"
+	case "Top":
+		return "⊤"
+	case "Stream Aggregate":
+		return "≡"
+	case "Key Lookup":
+		return "🔑"
 	default:
-		return "▶"
+		return "▸"
 	}
+}
+
+func formatRows(rows float64) string {
+	if rows >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", rows/1_000_000)
+	}
+	if rows >= 1_000 {
+		return fmt.Sprintf("%.0fK", rows/1_000)
+	}
+	return fmt.Sprintf("%.0f", rows)
 }
 
 // layoutTree assigns X,Y to every node. Returns y position of this node.
@@ -89,8 +113,8 @@ type PlanCanvas struct {
 	treeHeight float32
 }
 
-func newPlanCanvas(plan *parser.QueryPlan, lang *Lang) *PlanCanvas {
-	pc := &PlanCanvas{plan: plan, lang: lang, Scale: 1.0}
+func newPlanCanvas(plan *parser.QueryPlan, lang *Lang, initialScale float32) *PlanCanvas {
+	pc := &PlanCanvas{plan: plan, lang: lang, Scale: initialScale}
 	if plan != nil && plan.RootOp != nil {
 		pc.treeWidth, pc.treeHeight = calcTreeSize(plan.RootOp)
 		pc.treeWidth += 40
@@ -131,7 +155,6 @@ func (pc *PlanCanvas) MinSize() fyne.Size {
 	return fyne.NewSize(pc.treeWidth*pc.Scale, pc.treeHeight*pc.Scale)
 }
 
-// planRenderer draws edges and nodes onto the canvas.
 type planRenderer struct {
 	pc      *PlanCanvas
 	objects []fyne.CanvasObject
@@ -140,7 +163,6 @@ type planRenderer struct {
 func (r *planRenderer) Layout(_ fyne.Size) {}
 func (r *planRenderer) MinSize() fyne.Size { return r.pc.MinSize() }
 func (r *planRenderer) Destroy()           {}
-
 func (r *planRenderer) Objects() []fyne.CanvasObject { return r.objects }
 
 func (r *planRenderer) Refresh() {
@@ -181,35 +203,43 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 	h := nodeH * s
 
 	bg := canvas.NewRectangle(graphNodeColor(op))
-	bg.CornerRadius = 6 * s
+	bg.CornerRadius = 4 * s
 	bg.Resize(fyne.NewSize(w, h))
 	bg.Move(fyne.NewPos(x, y))
 
 	border := canvas.NewRectangle(color.Transparent)
 	border.StrokeColor = color.RGBA{R: 40, G: 40, B: 40, A: 180}
 	border.StrokeWidth = 1
-	border.CornerRadius = 6 * s
+	border.CornerRadius = 4 * s
 	border.Resize(fyne.NewSize(w, h))
 	border.Move(fyne.NewPos(x, y))
 
-	t1 := canvas.NewText(operatorIcon(op.PhysicalOp)+" "+op.PhysicalOp, color.White)
-	t1.TextSize = 11 * s
-	t1.TextStyle = fyne.TextStyle{Bold: true}
-	t1.Move(fyne.NewPos(x+5*s, y+4*s))
+	// Row 1: icon + PhysicalOp (bold)
+	icon := canvas.NewText(operatorIcon(op.PhysicalOp), color.White)
+	icon.TextSize = 11 * s
+	icon.Move(fyne.NewPos(x+4*s, y+4*s))
 
-	t2 := canvas.NewText(fmt.Sprintf("Cost: %.0f%%  Rows: %.0f", op.CostPercent, op.EstimatedRows),
-		color.RGBA{R: 230, G: 230, B: 230, A: 255})
-	t2.TextSize = 9 * s
-	t2.Move(fyne.NewPos(x+5*s, y+36*s))
+	opName := canvas.NewText(op.PhysicalOp, color.White)
+	opName.TextSize = 11 * s
+	opName.TextStyle = fyne.TextStyle{Bold: true}
+	opName.Move(fyne.NewPos(x+20*s, y+4*s))
 
-	r.objects = append(r.objects, bg, border, t1, t2)
-
+	// Row 2: LogicalOp (italic, lighter)
+	r.objects = append(r.objects, bg, border, icon, opName)
 	if op.LogicalOp != "" && op.LogicalOp != op.PhysicalOp {
-		t3 := canvas.NewText("("+op.LogicalOp+")", color.RGBA{R: 210, G: 210, B: 210, A: 255})
-		t3.TextSize = 9 * s
-		t3.Move(fyne.NewPos(x+5*s, y+20*s))
-		r.objects = append(r.objects, t3)
+		logical := canvas.NewText("("+op.LogicalOp+")", color.RGBA{R: 230, G: 230, B: 230, A: 255})
+		logical.TextSize = 10 * s
+		logical.Move(fyne.NewPos(x+20*s, y+18*s))
+		r.objects = append(r.objects, logical)
 	}
+
+	// Row 3: Cost% + Rows (bottom)
+	stats := canvas.NewText(
+		fmt.Sprintf("Cost: %.0f%%  Rows: %s", op.CostPercent, formatRows(op.EstimatedRows)),
+		color.White)
+	stats.TextSize = 9 * s
+	stats.Move(fyne.NewPos(x+4*s, y+h-14*s))
+	r.objects = append(r.objects, stats)
 
 	for _, child := range op.Children {
 		r.drawNodes(child)
@@ -232,7 +262,7 @@ func graphNodeColor(op *parser.RelOp) color.Color {
 	}
 }
 
-// PlanGraph is the public entry point.
+// PlanGraph is the public entry point for a single statement graph.
 type PlanGraph struct {
 	plan *parser.QueryPlan
 	lang *Lang
@@ -243,14 +273,23 @@ func NewPlanGraph(plan *parser.QueryPlan, lang *Lang) *PlanGraph {
 }
 
 func (pg *PlanGraph) Widget() fyne.CanvasObject {
-	if pg.plan == nil || pg.plan.RootOp == nil {
+	return buildPlanCanvasWidget(pg.plan, pg.lang, 1.0)
+}
+
+// MiniWidget returns a smaller, scrollable plan canvas for overview use.
+func (pg *PlanGraph) MiniWidget() fyne.CanvasObject {
+	return buildPlanCanvasWidget(pg.plan, pg.lang, 0.55)
+}
+
+func buildPlanCanvasWidget(plan *parser.QueryPlan, lang *Lang, scale float32) fyne.CanvasObject {
+	if plan == nil || plan.RootOp == nil {
 		return widget.NewLabel("(no plan graph)")
 	}
 
 	yOff := float32(10)
-	layoutTree(pg.plan.RootOp, 0, &yOff)
+	layoutTree(plan.RootOp, 0, &yOff)
 
-	pc := newPlanCanvas(pg.plan, pg.lang)
+	pc := newPlanCanvas(plan, lang, scale)
 
 	zoomIn := widget.NewButton("+", func() {
 		pc.Scale *= 1.2
@@ -267,7 +306,7 @@ func (pg *PlanGraph) Widget() fyne.CanvasObject {
 		pc.Refresh()
 	})
 	reset := widget.NewButton("Reset", func() {
-		pc.Scale = 1.0
+		pc.Scale = scale
 		pc.OffsetX = 0
 		pc.OffsetY = 0
 		pc.Refresh()
@@ -275,7 +314,7 @@ func (pg *PlanGraph) Widget() fyne.CanvasObject {
 
 	controls := container.NewHBox(zoomIn, zoomOut, reset)
 	scroll := container.NewScroll(pc)
-	scroll.SetMinSize(fyne.NewSize(400, 300))
+	scroll.SetMinSize(fyne.NewSize(400, 200))
 
 	return container.NewBorder(controls, nil, nil, nil, scroll)
 }
