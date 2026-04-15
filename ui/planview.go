@@ -13,131 +13,110 @@ import (
 )
 
 type PlanView struct {
-	lang      *Lang
-	content   *fyne.Container
-	wrapper   *container.Scroll
+	lang    *Lang
+	wrapper fyne.CanvasObject
+	replace func(fyne.CanvasObject)
 }
 
 func NewPlanView(lang *Lang) *PlanView {
 	pv := &PlanView{lang: lang}
 	placeholder := widget.NewLabel(lang.T("noFile"))
-	pv.content = container.NewVBox(placeholder)
-	pv.wrapper = container.NewScroll(pv.content)
+	// Use a border container so the inner content fills the space
+	inner := container.NewBorder(nil, nil, nil, nil, placeholder)
+	pv.wrapper = inner
 	return pv
 }
 
 func (pv *PlanView) Load(path string) {
 	ext := strings.ToLower(filepath.Ext(path))
-	pv.content.Objects = nil
+	var content fyne.CanvasObject
 
 	switch ext {
 	case ".sqlplan":
-		pv.loadSqlPlan(path)
+		content = pv.buildSqlPlanView(path)
 	case ".xdl":
-		pv.loadDeadlock(path)
+		content = pv.buildDeadlockView(path)
 	default:
-		pv.content.Objects = []fyne.CanvasObject{
-			widget.NewLabel("Unsupported file type: " + ext),
-		}
+		content = widget.NewLabel("Unsupported file type: " + ext)
 	}
-	pv.content.Refresh()
+
+	// Replace inner content: build a new border container
+	inner := pv.wrapper.(*fyne.Container)
+	inner.Objects = []fyne.CanvasObject{content}
+	inner.Refresh()
 }
 
-func (pv *PlanView) loadSqlPlan(path string) {
+func (pv *PlanView) buildSqlPlanView(path string) fyne.CanvasObject {
 	qp, err := parser.ParseSqlPlan(path)
 	if err != nil {
-		pv.content.Objects = []fyne.CanvasObject{
-			widget.NewLabel("Error: " + err.Error()),
-		}
-		return
+		return widget.NewLabel("Parse error: " + err.Error())
+	}
+	if qp.RootOp == nil {
+		return widget.NewLabel("No query plan found in file")
 	}
 
+	// Info panel (top, fixed height)
 	stmt := qp.StatementText
 	if len(stmt) > 200 {
 		stmt = stmt[:200] + "..."
 	}
+	stmtLbl := widget.NewLabel("SQL: " + stmt)
+	stmtLbl.Wrapping = fyne.TextWrapWord
 
-	stmtLabel := widget.NewLabel("Statement: " + stmt)
-	stmtLabel.Wrapping = fyne.TextWrapWord
+	costLbl := widget.NewLabel(fmt.Sprintf("Cost: %.4f   Est. Rows: %.0f   Nodes: %d",
+		qp.TotalCost, qp.EstimatedRows, parser.CountNodes(qp.RootOp)))
+	costLbl.TextStyle = fyne.TextStyle{Bold: true}
 
-	costLabel := widget.NewLabel(fmt.Sprintf("Est. Cost: %.4f   |   Est. Rows: %.0f",
-		qp.TotalCost, qp.EstimatedRows))
-	costLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	graph := NewPlanGraph(qp, pv.lang)
-
-	alertItems := []fyne.CanvasObject{}
+	alerts := []fyne.CanvasObject{}
 	if len(qp.Warnings) > 0 {
-		alertItems = append(alertItems,
-			widget.NewLabel(fmt.Sprintf("⚠️  %s: %d", pv.lang.T("warnings"), len(qp.Warnings))))
+		alerts = append(alerts, widget.NewLabel(fmt.Sprintf("⚠️  %s: %d", pv.lang.T("warnings"), len(qp.Warnings))))
 	}
 	if len(qp.MissingIndexes) > 0 {
-		alertItems = append(alertItems,
-			widget.NewLabel(fmt.Sprintf("🔍 %s: %d", pv.lang.T("missingIndexes"), len(qp.MissingIndexes))))
+		alerts = append(alerts, widget.NewLabel(fmt.Sprintf("🔍 %s: %d", pv.lang.T("missingIndexes"), len(qp.MissingIndexes))))
 	}
-	if qp.RootOp != nil {
-		scans := countOp(qp.RootOp, "Table Scan")
-		if scans > 0 {
-			alertItems = append(alertItems,
-				widget.NewLabel(fmt.Sprintf("🔴 %s: %d", pv.lang.T("tableScan"), scans)))
-		}
+	scans := countOpType(qp.RootOp, "Table Scan")
+	if scans > 0 {
+		alerts = append(alerts, widget.NewLabel(fmt.Sprintf("🔴 %s: %d", pv.lang.T("tableScan"), scans)))
 	}
 
-	objects := []fyne.CanvasObject{stmtLabel, costLabel, graph.Widget()}
-	if len(alertItems) > 0 {
-		objects = append(objects, alertItems...)
-	}
+	infoItems := []fyne.CanvasObject{stmtLbl, costLbl}
+	infoItems = append(infoItems, alerts...)
+	infoPanel := container.NewVBox(infoItems...)
 
-	pv.content.Objects = objects
+	// Graph panel fills the rest
+	graph := NewPlanGraph(qp, pv.lang)
+	graphWidget := graph.Widget()
+
+	return container.NewBorder(infoPanel, nil, nil, nil, graphWidget)
 }
 
-func (pv *PlanView) loadDeadlock(path string) {
+func (pv *PlanView) buildDeadlockView(path string) fyne.CanvasObject {
 	dg, err := parser.ParseDeadlock(path)
 	if err != nil {
-		pv.content.Objects = []fyne.CanvasObject{
-			widget.NewLabel("Error: " + err.Error()),
-		}
-		return
+		return widget.NewLabel("Parse error: " + err.Error())
 	}
 
-	title := widget.NewLabel("🔴 " + pv.lang.T("deadlockVictim") + ": " + dg.Victim)
-	title.TextStyle = fyne.TextStyle{Bold: true}
+	// Info panel
+	victimLabel := widget.NewLabel(fmt.Sprintf("🔴 %s  |  %d processes  |  %d resources",
+		pv.lang.T("deadlockVictim"), len(dg.Processes), len(dg.Resources)))
+	victimLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	procHeader := widget.NewLabel(pv.lang.T("processes") + ":")
-	procHeader.TextStyle = fyne.TextStyle{Bold: true}
-
-	objects := []fyne.CanvasObject{title, procHeader}
-
+	// Find victim process for extra info
 	for _, p := range dg.Processes {
-		prefix := "  "
 		if p.IsVictim {
-			prefix = "💀 "
-		}
-		label := fmt.Sprintf("%sSPID %d  |  %s  |  Wait: %s", prefix, p.SPID, p.Login, p.WaitResource)
-		lbl := widget.NewLabel(label)
-		objects = append(objects, lbl)
-		if p.QueryText != "" {
-			q := strings.TrimSpace(p.QueryText)
-			if len(q) > 150 {
-				q = q[:150] + "..."
-			}
-			objects = append(objects, widget.NewLabel("    "+q))
+			victimLabel.SetText(fmt.Sprintf("💀 Victim: SPID %d (%s)  |  %d processes  |  %d resources",
+				p.SPID, p.Login, len(dg.Processes), len(dg.Resources)))
+			break
 		}
 	}
 
-	resHeader := widget.NewLabel(pv.lang.T("resources") + ":")
-	resHeader.TextStyle = fyne.TextStyle{Bold: true}
-	objects = append(objects, resHeader)
+	infoPanel := container.NewVBox(victimLabel)
+	graphWidget := NewDeadlockGraph(dg, pv.lang)
 
-	for _, r := range dg.Resources {
-		objects = append(objects, widget.NewLabel(
-			fmt.Sprintf("  [%s] %s  mode: %s", r.Type, r.ObjectName, r.Mode)))
-	}
-
-	pv.content.Objects = objects
+	return container.NewBorder(infoPanel, nil, nil, nil, graphWidget)
 }
 
-func countOp(op *parser.RelOp, name string) int {
+func countOpType(op *parser.RelOp, name string) int {
 	if op == nil {
 		return 0
 	}
@@ -146,11 +125,20 @@ func countOp(op *parser.RelOp, name string) int {
 		n = 1
 	}
 	for _, c := range op.Children {
-		n += countOp(c, name)
+		n += countOpType(c, name)
 	}
 	return n
 }
 
 func (pv *PlanView) Widget() fyne.CanvasObject {
 	return pv.wrapper
+}
+
+// Helper: trim query text
+func trimQuery(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }

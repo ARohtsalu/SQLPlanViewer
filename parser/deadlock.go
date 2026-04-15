@@ -9,6 +9,7 @@ type DeadlockGraph struct {
 	Victim    string
 	Processes []DeadlockProcess
 	Resources []DeadlockResource
+	Edges     []DeadlockEdge
 }
 
 type DeadlockProcess struct {
@@ -16,23 +17,43 @@ type DeadlockProcess struct {
 	SPID         int
 	Login        string
 	WaitResource string
+	LogUsed      int
 	IsVictim     bool
 	QueryText    string
+	X, Y         float32
 }
 
 type DeadlockResource struct {
+	ID         string
 	Type       string
 	ObjectName string
+	IndexName  string
 	Mode       string
+	X, Y       float32
 }
 
-// --- XML structs ---
+type DeadlockEdge struct {
+	ProcessID  string
+	ResourceID string
+	Mode       string
+	IsOwner    bool // true = process owns resource; false = process waits for resource
+}
+
+// XML structs
 
 type xmlDeadlock struct {
-	XMLName     xml.Name          `xml:"deadlock"`
-	Victim      string            `xml:"victim,attr"`
-	ProcessList []xmlDLProcess    `xml:"process-list>process"`
-	ResourceList xmlDLResourceList `xml:"resource-list"`
+	XMLName     xml.Name         `xml:"deadlock"`
+	VictimList  xmlVictimList    `xml:"victim-list"`
+	ProcessList []xmlDLProcess   `xml:"process-list>process"`
+	Resources   xmlDLResources   `xml:"resource-list"`
+}
+
+type xmlVictimList struct {
+	VictimProcess xmlVictimProcess `xml:"victimProcess"`
+}
+
+type xmlVictimProcess struct {
+	ID string `xml:"id,attr"`
 }
 
 type xmlDLProcess struct {
@@ -40,20 +61,53 @@ type xmlDLProcess struct {
 	SPID         int    `xml:"spid,attr"`
 	LoginName    string `xml:"loginname,attr"`
 	WaitResource string `xml:"waitresource,attr"`
+	LogUsed      int    `xml:"logused,attr"`
 	InputBuf     string `xml:"inputbuf"`
 }
 
-type xmlDLResourceList struct {
-	PageLocks   []xmlDLLock `xml:"pagelock"`
-	RowLocks    []xmlDLLock `xml:"ridlock"`
-	ObjectLocks []xmlDLLock `xml:"objectlock"`
-	KeyLocks    []xmlDLLock `xml:"keylock"`
+type xmlDLResources struct {
+	KeyLocks    []xmlDLKeyLock    `xml:"keylock"`
+	PageLocks   []xmlDLPageLock   `xml:"pagelock"`
+	RowLocks    []xmlDLRowLock    `xml:"ridlock"`
+	ObjectLocks []xmlDLObjectLock `xml:"objectlock"`
 }
 
-type xmlDLLock struct {
-	ObjectName string `xml:"objectname,attr"`
-	Mode       string `xml:"mode,attr"`
-	Type       string `xml:"type,attr"`
+type xmlDLKeyLock struct {
+	ID         string       `xml:"id,attr"`
+	ObjectName string       `xml:"objectname,attr"`
+	IndexName  string       `xml:"indexname,attr"`
+	Mode       string       `xml:"mode,attr"`
+	Owners     []xmlDLOwner `xml:"owner-list>owner"`
+	Waiters    []xmlDLOwner `xml:"waiter-list>waiter"`
+}
+
+type xmlDLPageLock struct {
+	ID         string       `xml:"id,attr"`
+	ObjectName string       `xml:"objectname,attr"`
+	Mode       string       `xml:"mode,attr"`
+	Owners     []xmlDLOwner `xml:"owner-list>owner"`
+	Waiters    []xmlDLOwner `xml:"waiter-list>waiter"`
+}
+
+type xmlDLRowLock struct {
+	ID         string       `xml:"id,attr"`
+	ObjectName string       `xml:"objectname,attr"`
+	Mode       string       `xml:"mode,attr"`
+	Owners     []xmlDLOwner `xml:"owner-list>owner"`
+	Waiters    []xmlDLOwner `xml:"waiter-list>waiter"`
+}
+
+type xmlDLObjectLock struct {
+	ID         string       `xml:"id,attr"`
+	ObjectName string       `xml:"objectname,attr"`
+	Mode       string       `xml:"mode,attr"`
+	Owners     []xmlDLOwner `xml:"owner-list>owner"`
+	Waiters    []xmlDLOwner `xml:"waiter-list>waiter"`
+}
+
+type xmlDLOwner struct {
+	ID   string `xml:"id,attr"`
+	Mode string `xml:"mode,attr"`
 }
 
 func ParseDeadlock(path string) (*DeadlockGraph, error) {
@@ -68,7 +122,7 @@ func ParseDeadlock(path string) (*DeadlockGraph, error) {
 	}
 
 	dg := &DeadlockGraph{
-		Victim: root.Victim,
+		Victim: root.VictimList.VictimProcess.ID,
 	}
 
 	for _, p := range root.ProcessList {
@@ -77,29 +131,50 @@ func ParseDeadlock(path string) (*DeadlockGraph, error) {
 			SPID:         p.SPID,
 			Login:        p.LoginName,
 			WaitResource: p.WaitResource,
-			IsVictim:     p.ID == root.Victim,
+			LogUsed:      p.LogUsed,
+			IsVictim:     p.ID == dg.Victim,
 			QueryText:    p.InputBuf,
 		})
 	}
 
-	addLocks := func(locks []xmlDLLock, lockType string) {
-		for _, l := range locks {
-			t := lockType
-			if l.Type != "" {
-				t = l.Type
-			}
-			dg.Resources = append(dg.Resources, DeadlockResource{
-				Type:       t,
-				ObjectName: l.ObjectName,
-				Mode:       l.Mode,
+	addLock := func(id, objName, indexName, lockType, mode string, owners, waiters []xmlDLOwner) {
+		dg.Resources = append(dg.Resources, DeadlockResource{
+			ID:         id,
+			Type:       lockType,
+			ObjectName: objName,
+			IndexName:  indexName,
+			Mode:       mode,
+		})
+		for _, o := range owners {
+			dg.Edges = append(dg.Edges, DeadlockEdge{
+				ProcessID:  o.ID,
+				ResourceID: id,
+				Mode:       o.Mode,
+				IsOwner:    true,
+			})
+		}
+		for _, w := range waiters {
+			dg.Edges = append(dg.Edges, DeadlockEdge{
+				ProcessID:  w.ID,
+				ResourceID: id,
+				Mode:       w.Mode,
+				IsOwner:    false,
 			})
 		}
 	}
 
-	addLocks(root.ResourceList.PageLocks, "Page Lock")
-	addLocks(root.ResourceList.RowLocks, "Row Lock")
-	addLocks(root.ResourceList.ObjectLocks, "Object Lock")
-	addLocks(root.ResourceList.KeyLocks, "Key Lock")
+	for _, l := range root.Resources.KeyLocks {
+		addLock(l.ID, l.ObjectName, l.IndexName, "Key Lock", l.Mode, l.Owners, l.Waiters)
+	}
+	for _, l := range root.Resources.PageLocks {
+		addLock(l.ID, l.ObjectName, "", "Page Lock", l.Mode, l.Owners, l.Waiters)
+	}
+	for _, l := range root.Resources.RowLocks {
+		addLock(l.ID, l.ObjectName, "", "Row Lock", l.Mode, l.Owners, l.Waiters)
+	}
+	for _, l := range root.Resources.ObjectLocks {
+		addLock(l.ID, l.ObjectName, "", "Object Lock", l.Mode, l.Owners, l.Waiters)
+	}
 
 	return dg, nil
 }

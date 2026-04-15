@@ -22,7 +22,7 @@ type RelOp struct {
 	EstimatedCost float64
 	EstimatedRows float64
 	CostPercent   float64
-	X, Y          float32 // layout positions
+	X, Y          float32
 	Children      []*RelOp
 }
 
@@ -37,7 +37,7 @@ type Warning struct {
 	Text string
 }
 
-// --- XML structs ---
+// XML structs
 
 type xmlShowPlanXML struct {
 	XMLName xml.Name   `xml:"ShowPlanXML"`
@@ -62,13 +62,13 @@ type xmlQPlan struct {
 }
 
 type xmlMissingIndexGroup struct {
-	Impact  float64        `xml:"Impact,attr"`
+	Impact  float64         `xml:"Impact,attr"`
 	Indexes []xmlMissingIdx `xml:"MissingIndex"`
 }
 
 type xmlMissingIdx struct {
-	Database     string       `xml:"Database,attr"`
-	Table        string       `xml:"Table,attr"`
+	Database     string        `xml:"Database,attr"`
+	Table        string        `xml:"Table,attr"`
 	ColumnGroups []xmlColGroup `xml:"ColumnGroup"`
 }
 
@@ -90,7 +90,6 @@ type xmlColNoStats struct {
 	Column string `xml:"Column,attr"`
 }
 
-// xmlRelOp captures attributes + raw inner XML for recursive child extraction
 type xmlRelOp struct {
 	NodeID      int     `xml:"NodeId,attr"`
 	PhysicalOp  string  `xml:"PhysicalOp,attr"`
@@ -106,64 +105,75 @@ func ParseSqlPlan(path string) (*QueryPlan, error) {
 		return nil, err
 	}
 
+	// Strip XML namespace so struct tags match without namespace prefix
+	data = bytes.ReplaceAll(data,
+		[]byte(`xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"`),
+		[]byte(""))
+
 	var root xmlShowPlanXML
 	if err := xml.Unmarshal(data, &root); err != nil {
 		return nil, err
 	}
 
-	qp := &QueryPlan{}
-
-	for _, batch := range root.Batches {
-		for _, stmt := range batch.Statements {
-			qp.StatementText = stmt.StatementText
-			qp.TotalCost = stmt.SubTreeCost
-			qp.EstimatedRows = stmt.EstimatedRows
-
-			if stmt.QueryPlan != nil {
-				for _, mig := range stmt.QueryPlan.MissingIndexes {
-					for _, mi := range mig.Indexes {
-						cols := ""
-						for _, cg := range mi.ColumnGroups {
-							for i, c := range cg.Columns {
-								if i > 0 {
-									cols += ", "
-								}
-								cols += c.Name
-							}
-						}
-						qp.MissingIndexes = append(qp.MissingIndexes, MissingIndex{
-							Database: mi.Database,
-							Table:    mi.Table,
-							Columns:  cols,
-							Impact:   mig.Impact,
-						})
-					}
-				}
-
-				if w := stmt.QueryPlan.Warnings; w != nil {
-					for _, c := range w.ColumnsNoStats {
-						qp.Warnings = append(qp.Warnings, Warning{
-							Text: "No statistics: " + c.Table + "." + c.Column,
-						})
-					}
-					for range w.SpillToTempDb {
-						qp.Warnings = append(qp.Warnings, Warning{Text: "Spill to TempDB"})
-					}
-				}
-
-				if stmt.QueryPlan.RelOp != nil {
-					qp.RootOp = convertRelOp(stmt.QueryPlan.RelOp, qp.TotalCost)
-				}
+	// Find the most expensive statement that has an actual query plan
+	var best *xmlStmt
+	for i := range root.Batches {
+		for j := range root.Batches[i].Statements {
+			stmt := &root.Batches[i].Statements[j]
+			if stmt.QueryPlan == nil || stmt.QueryPlan.RelOp == nil {
+				continue
 			}
-			return qp, nil
+			if best == nil || stmt.SubTreeCost > best.SubTreeCost {
+				best = stmt
+			}
 		}
 	}
 
+	if best == nil {
+		return &QueryPlan{}, nil
+	}
+
+	qp := &QueryPlan{
+		StatementText: best.StatementText,
+		TotalCost:     best.SubTreeCost,
+		EstimatedRows: best.EstimatedRows,
+	}
+
+	for _, mig := range best.QueryPlan.MissingIndexes {
+		for _, mi := range mig.Indexes {
+			cols := ""
+			for _, cg := range mi.ColumnGroups {
+				for i, c := range cg.Columns {
+					if i > 0 {
+						cols += ", "
+					}
+					cols += c.Name
+				}
+			}
+			qp.MissingIndexes = append(qp.MissingIndexes, MissingIndex{
+				Database: mi.Database,
+				Table:    mi.Table,
+				Columns:  cols,
+				Impact:   mig.Impact,
+			})
+		}
+	}
+
+	if w := best.QueryPlan.Warnings; w != nil {
+		for _, c := range w.ColumnsNoStats {
+			qp.Warnings = append(qp.Warnings, Warning{
+				Text: "No statistics: " + c.Table + "." + c.Column,
+			})
+		}
+		for range w.SpillToTempDb {
+			qp.Warnings = append(qp.Warnings, Warning{Text: "Spill to TempDB"})
+		}
+	}
+
+	qp.RootOp = convertRelOp(best.QueryPlan.RelOp, qp.TotalCost)
 	return qp, nil
 }
 
-// convertRelOp converts xmlRelOp to RelOp, recursively finding child RelOps
-// in the innerXML regardless of wrapper element names.
 func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 	if x == nil {
 		return nil
@@ -178,12 +188,8 @@ func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 	if totalCost > 0 {
 		op.CostPercent = x.SubtreeCost / totalCost * 100
 	}
-
-	// Find all direct <RelOp> children anywhere in the inner XML
-	childOps := findDirectRelOps(x.InnerXML)
-	for _, c := range childOps {
-		child := convertRelOp(c, totalCost)
-		if child != nil {
+	for _, c := range findDirectRelOps(x.InnerXML) {
+		if child := convertRelOp(c, totalCost); child != nil {
 			op.Children = append(op.Children, child)
 		}
 	}
@@ -191,9 +197,13 @@ func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 }
 
 // findDirectRelOps finds <RelOp> elements that are direct children
-// of the current element's content (one level deep in wrappers).
-// We skip nested RelOps inside found RelOps.
+// within any wrapper elements, using a depth-aware token walk.
 func findDirectRelOps(data []byte) []*xmlRelOp {
+	// Strip namespace from inner XML too
+	data = bytes.ReplaceAll(data,
+		[]byte(`xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"`),
+		[]byte(""))
+
 	var result []*xmlRelOp
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	depth := 0
@@ -210,7 +220,6 @@ func findDirectRelOps(data []byte) []*xmlRelOp {
 				if err := dec.DecodeElement(&ro, &t); err == nil {
 					result = append(result, &ro)
 				}
-				// Don't increment depth — DecodeElement consumed everything
 			} else {
 				depth++
 			}

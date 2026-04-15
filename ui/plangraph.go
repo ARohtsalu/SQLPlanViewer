@@ -13,13 +13,12 @@ import (
 )
 
 const (
-	nodeW       = float32(160)
-	nodeH       = float32(60)
+	nodeW        = float32(160)
+	nodeH        = float32(60)
 	nodeSpacingX = float32(200)
 	nodeSpacingY = float32(80)
 )
 
-// operatorIcon returns a simple unicode icon for the operator.
 func operatorIcon(op string) string {
 	switch op {
 	case "Index Seek", "Clustered Index Seek":
@@ -39,55 +38,63 @@ func operatorIcon(op string) string {
 	}
 }
 
-// --- Layout ---
-
-type layoutNode struct {
-	op *parser.RelOp
-	x  float32
-	y  float32
-}
-
-func layoutTree(op *parser.RelOp, depth int, yOffset *float32) (x, y float32) {
-	x = float32(depth) * nodeSpacingX
-
+// layoutTree assigns X,Y to every node. Returns y position of this node.
+func layoutTree(op *parser.RelOp, depth int, yOffset *float32) float32 {
 	if len(op.Children) == 0 {
-		y = *yOffset
+		op.X = float32(depth) * nodeSpacingX
+		op.Y = *yOffset
 		*yOffset += nodeSpacingY
-		op.X = x
-		op.Y = y
-		return
+		return op.Y
 	}
-
 	firstY, lastY := float32(0), float32(0)
 	for i, child := range op.Children {
-		_, cy := layoutTree(child, depth+1, yOffset)
+		cy := layoutTree(child, depth+1, yOffset)
 		if i == 0 {
 			firstY = cy
 		}
 		lastY = cy
 	}
-	y = (firstY + lastY) / 2
-	op.X = x
-	op.Y = y
-	return
+	op.X = float32(depth) * nodeSpacingX
+	op.Y = (firstY + lastY) / 2
+	return op.Y
 }
 
-// --- PlanCanvas widget ---
+func calcTreeSize(op *parser.RelOp) (w, h float32) {
+	if op == nil {
+		return 0, 0
+	}
+	maxX := op.X + nodeW
+	maxY := op.Y + nodeH
+	for _, c := range op.Children {
+		cw, ch := calcTreeSize(c)
+		if cw > maxX {
+			maxX = cw
+		}
+		if ch > maxY {
+			maxY = ch
+		}
+	}
+	return maxX, maxY
+}
 
+// PlanCanvas is a zoomable/pannable canvas for the plan graph.
 type PlanCanvas struct {
 	widget.BaseWidget
-	plan    *parser.QueryPlan
-	lang    *Lang
-	Scale   float32
-	OffsetX float32
-	OffsetY float32
+	plan       *parser.QueryPlan
+	lang       *Lang
+	Scale      float32
+	OffsetX    float32
+	OffsetY    float32
+	treeWidth  float32
+	treeHeight float32
 }
 
 func newPlanCanvas(plan *parser.QueryPlan, lang *Lang) *PlanCanvas {
-	pc := &PlanCanvas{
-		plan:  plan,
-		lang:  lang,
-		Scale: 1.0,
+	pc := &PlanCanvas{plan: plan, lang: lang, Scale: 1.0}
+	if plan != nil && plan.RootOp != nil {
+		pc.treeWidth, pc.treeHeight = calcTreeSize(plan.RootOp)
+		pc.treeWidth += 40
+		pc.treeHeight += 40
 	}
 	pc.ExtendBaseWidget(pc)
 	return pc
@@ -121,50 +128,25 @@ func (pc *PlanCanvas) Dragged(ev *fyne.DragEvent) {
 func (pc *PlanCanvas) DragEnd() {}
 
 func (pc *PlanCanvas) MinSize() fyne.Size {
-	if pc.plan == nil || pc.plan.RootOp == nil {
-		return fyne.NewSize(400, 300)
-	}
-	w, h := treeSize(pc.plan.RootOp)
-	return fyne.NewSize(
-		(w+nodeW+40)*pc.Scale,
-		(h+nodeH+40)*pc.Scale,
-	)
+	return fyne.NewSize(pc.treeWidth*pc.Scale, pc.treeHeight*pc.Scale)
 }
 
-func treeSize(op *parser.RelOp) (float32, float32) {
-	if op == nil {
-		return 0, 0
-	}
-	maxX := op.X + nodeW
-	maxY := op.Y + nodeH
-	for _, c := range op.Children {
-		cx, cy := treeSize(c)
-		if cx > maxX {
-			maxX = cx
-		}
-		if cy > maxY {
-			maxY = cy
-		}
-	}
-	return maxX, maxY
-}
-
-// --- Renderer ---
-
+// planRenderer draws edges and nodes onto the canvas.
 type planRenderer struct {
 	pc      *PlanCanvas
 	objects []fyne.CanvasObject
 }
 
 func (r *planRenderer) Layout(_ fyne.Size) {}
+func (r *planRenderer) MinSize() fyne.Size { return r.pc.MinSize() }
+func (r *planRenderer) Destroy()           {}
 
-func (r *planRenderer) MinSize() fyne.Size {
-	return r.pc.MinSize()
-}
+func (r *planRenderer) Objects() []fyne.CanvasObject { return r.objects }
 
 func (r *planRenderer) Refresh() {
 	r.objects = nil
 	if r.pc.plan == nil || r.pc.plan.RootOp == nil {
+		canvas.Refresh(r.pc)
 		return
 	}
 	r.drawEdges(r.pc.plan.RootOp)
@@ -172,46 +154,26 @@ func (r *planRenderer) Refresh() {
 	canvas.Refresh(r.pc)
 }
 
-func (r *planRenderer) Objects() []fyne.CanvasObject {
-	return r.objects
-}
-
-func (r *planRenderer) Destroy() {}
-
-func (r *planRenderer) tx(x float32) float32 {
-	return x*r.pc.Scale + r.pc.OffsetX + 10
-}
-
-func (r *planRenderer) ty(y float32) float32 {
-	return y*r.pc.Scale + r.pc.OffsetY + 10
-}
+func (r *planRenderer) tx(x float32) float32 { return x*r.pc.Scale + r.pc.OffsetX + 10 }
+func (r *planRenderer) ty(y float32) float32 { return y*r.pc.Scale + r.pc.OffsetY + 10 }
 
 func (r *planRenderer) drawEdges(op *parser.RelOp) {
-	if op == nil {
-		return
-	}
+	s := r.pc.Scale
 	px := r.tx(op.X + nodeW)
 	py := r.ty(op.Y + nodeH/2)
-
 	for _, child := range op.Children {
 		cx := r.tx(child.X)
 		cy := r.ty(child.Y + nodeH/2)
-
-		line := canvas.NewLine(color.RGBA{R: 120, G: 120, B: 120, A: 200})
-		line.StrokeWidth = 1.5
+		line := canvas.NewLine(color.RGBA{R: 100, G: 100, B: 100, A: 200})
+		line.StrokeWidth = 1.5 * s
 		line.Position1 = fyne.NewPos(px, py)
 		line.Position2 = fyne.NewPos(cx, cy)
 		r.objects = append(r.objects, line)
-
 		r.drawEdges(child)
 	}
 }
 
 func (r *planRenderer) drawNodes(op *parser.RelOp) {
-	if op == nil {
-		return
-	}
-
 	s := r.pc.Scale
 	x := r.tx(op.X)
 	y := r.ty(op.Y)
@@ -224,32 +186,30 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 	bg.Move(fyne.NewPos(x, y))
 
 	border := canvas.NewRectangle(color.Transparent)
-	border.StrokeColor = color.RGBA{R: 60, G: 60, B: 60, A: 180}
+	border.StrokeColor = color.RGBA{R: 40, G: 40, B: 40, A: 180}
 	border.StrokeWidth = 1
 	border.CornerRadius = 6 * s
 	border.Resize(fyne.NewSize(w, h))
 	border.Move(fyne.NewPos(x, y))
 
-	icon := operatorIcon(op.PhysicalOp)
-	line1 := canvas.NewText(icon+" "+op.PhysicalOp, color.White)
-	line1.TextSize = 11 * s
-	line1.TextStyle = fyne.TextStyle{Bold: true}
-	line1.Move(fyne.NewPos(x+5*s, y+5*s))
+	t1 := canvas.NewText(operatorIcon(op.PhysicalOp)+" "+op.PhysicalOp, color.White)
+	t1.TextSize = 11 * s
+	t1.TextStyle = fyne.TextStyle{Bold: true}
+	t1.Move(fyne.NewPos(x+5*s, y+4*s))
+
+	t2 := canvas.NewText(fmt.Sprintf("Cost: %.0f%%  Rows: %.0f", op.CostPercent, op.EstimatedRows),
+		color.RGBA{R: 230, G: 230, B: 230, A: 255})
+	t2.TextSize = 9 * s
+	t2.Move(fyne.NewPos(x+5*s, y+36*s))
+
+	r.objects = append(r.objects, bg, border, t1, t2)
 
 	if op.LogicalOp != "" && op.LogicalOp != op.PhysicalOp {
-		line2 := canvas.NewText("("+op.LogicalOp+")", color.RGBA{R: 220, G: 220, B: 220, A: 255})
-		line2.TextSize = 9 * s
-		line2.Move(fyne.NewPos(x+5*s, y+20*s))
+		t3 := canvas.NewText("("+op.LogicalOp+")", color.RGBA{R: 210, G: 210, B: 210, A: 255})
+		t3.TextSize = 9 * s
+		t3.Move(fyne.NewPos(x+5*s, y+20*s))
+		r.objects = append(r.objects, t3)
 	}
-
-	line3 := canvas.NewText(
-		fmt.Sprintf("Cost: %.0f%%  |  Rows: %.0f", op.CostPercent, op.EstimatedRows),
-		color.RGBA{R: 230, G: 230, B: 230, A: 255},
-	)
-	line3.TextSize = 9 * s
-	line3.Move(fyne.NewPos(x+5*s, y+35*s))
-
-	r.objects = append(r.objects, bg, border, line1, line3)
 
 	for _, child := range op.Children {
 		r.drawNodes(child)
@@ -266,14 +226,13 @@ func graphNodeColor(op *parser.RelOp) color.Color {
 		return color.RGBA{R: 50, G: 150, B: 50, A: 255}
 	default:
 		if op.CostPercent > 30 {
-			return color.RGBA{R: 220, G: 200, B: 0, A: 255}
+			return color.RGBA{R: 200, G: 180, B: 0, A: 255}
 		}
 		return color.RGBA{R: 70, G: 130, B: 180, A: 255}
 	}
 }
 
-// --- PlanGraph: public entry point ---
-
+// PlanGraph is the public entry point.
 type PlanGraph struct {
 	plan *parser.QueryPlan
 	lang *Lang
@@ -288,9 +247,8 @@ func (pg *PlanGraph) Widget() fyne.CanvasObject {
 		return widget.NewLabel("(no plan graph)")
 	}
 
-	// Layout the tree
-	yOffset := float32(10)
-	layoutTree(pg.plan.RootOp, 0, &yOffset)
+	yOff := float32(10)
+	layoutTree(pg.plan.RootOp, 0, &yOff)
 
 	pc := newPlanCanvas(pg.plan, pg.lang)
 
@@ -317,6 +275,7 @@ func (pg *PlanGraph) Widget() fyne.CanvasObject {
 
 	controls := container.NewHBox(zoomIn, zoomOut, reset)
 	scroll := container.NewScroll(pc)
+	scroll.SetMinSize(fyne.NewSize(400, 300))
 
 	return container.NewBorder(controls, nil, nil, nil, scroll)
 }

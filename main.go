@@ -11,7 +11,8 @@ import (
 func main() {
 	a := app.New()
 	w := a.NewWindow("SQL Plan Viewer")
-	w.Resize(fyne.NewSize(1100, 700))
+	w.Resize(fyne.NewSize(1400, 800))
+	w.SetFixedSize(false)
 
 	lang := ui.NewLang("EN")
 
@@ -23,7 +24,7 @@ func main() {
 	}
 
 	split := container.NewHSplit(fileTree.Widget(), planView.Widget())
-	split.SetOffset(0.28)
+	split.SetOffset(0.25)
 
 	toolbar := ui.NewToolbar(lang, fileTree, a)
 
