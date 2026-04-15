@@ -246,6 +246,11 @@ func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 	return op
 }
 
+// findDirectRelOps finds all direct-child <RelOp> elements within xmlData,
+// regardless of how many wrapper elements (e.g. <NestedLoops>, <Hash>) they
+// are nested inside. Because xml.Decoder.DecodeElement consumes the entire
+// subtree of each found RelOp, deeper RelOps are not visited a second time —
+// so we naturally get only the "shallowest" RelOp in each branch.
 func findDirectRelOps(data []byte) []*xmlRelOp {
 	data = bytes.ReplaceAll(data,
 		[]byte(`xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"`),
@@ -253,28 +258,26 @@ func findDirectRelOps(data []byte) []*xmlRelOp {
 
 	var result []*xmlRelOp
 	dec := xml.NewDecoder(bytes.NewReader(data))
-	depth := 0
 
 	for {
 		tok, err := dec.Token()
 		if err != nil {
 			break
 		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "RelOp" && depth == 0 {
-				var ro xmlRelOp
-				if err := dec.DecodeElement(&ro, &t); err == nil {
-					result = append(result, &ro)
-				}
-			} else {
-				depth++
-			}
-		case xml.EndElement:
-			if depth > 0 {
-				depth--
+		t, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		if t.Name.Local == "RelOp" {
+			// DecodeElement reads everything up to the matching </RelOp>,
+			// including any nested RelOp subtrees — so they won't be seen again.
+			var ro xmlRelOp
+			if err := dec.DecodeElement(&ro, &t); err == nil {
+				result = append(result, &ro)
 			}
 		}
+		// Non-RelOp start elements are intentionally skipped;
+		// their tokens will still be consumed in order by future Token() calls.
 	}
 	return result
 }
