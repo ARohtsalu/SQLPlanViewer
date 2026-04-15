@@ -8,8 +8,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
-
-	"sqlplanviewer/parser"
 )
 
 type FileTree struct {
@@ -55,13 +53,6 @@ func (ft *FileTree) fileLabel(path string) string {
 
 	if ext == ".xdl" {
 		return "🔴 " + name
-	}
-
-	if ext == ".sqlplan" {
-		plans, err := parser.ParseSqlPlan(path)
-		if err == nil && parser.HasWarningsOrScans(plans) {
-			return "⚠️  " + name
-		}
 	}
 
 	return "📄 " + name
