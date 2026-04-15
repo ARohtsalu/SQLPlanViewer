@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"bytes"
 	"encoding/xml"
 	"os"
 )
@@ -21,6 +22,7 @@ type RelOp struct {
 	EstimatedCost float64
 	EstimatedRows float64
 	CostPercent   float64
+	X, Y          float32 // layout positions
 	Children      []*RelOp
 }
 
@@ -35,7 +37,7 @@ type Warning struct {
 	Text string
 }
 
-// --- XML structs for parsing ---
+// --- XML structs ---
 
 type xmlShowPlanXML struct {
 	XMLName xml.Name   `xml:"ShowPlanXML"`
@@ -47,10 +49,10 @@ type xmlBatch struct {
 }
 
 type xmlStmt struct {
-	StatementText     string       `xml:"StatementText,attr"`
-	StatementSubCost  float64      `xml:"StatementSubTreeCost,attr"`
-	EstimatedRows     float64      `xml:"StatementEstRows,attr"`
-	QueryPlan         *xmlQPlan    `xml:"QueryPlan"`
+	StatementText string    `xml:"StatementText,attr"`
+	SubTreeCost   float64   `xml:"StatementSubTreeCost,attr"`
+	EstimatedRows float64   `xml:"StatementEstRows,attr"`
+	QueryPlan     *xmlQPlan `xml:"QueryPlan"`
 }
 
 type xmlQPlan struct {
@@ -60,20 +62,18 @@ type xmlQPlan struct {
 }
 
 type xmlMissingIndexGroup struct {
-	Impact  float64          `xml:"Impact,attr"`
-	Indexes []xmlMissingIdx  `xml:"MissingIndex"`
+	Impact  float64        `xml:"Impact,attr"`
+	Indexes []xmlMissingIdx `xml:"MissingIndex"`
 }
 
 type xmlMissingIdx struct {
-	Database  string          `xml:"Database,attr"`
-	Schema    string          `xml:"Schema,attr"`
-	Table     string          `xml:"Table,attr"`
+	Database     string       `xml:"Database,attr"`
+	Table        string       `xml:"Table,attr"`
 	ColumnGroups []xmlColGroup `xml:"ColumnGroup"`
 }
 
 type xmlColGroup struct {
-	Usage   string     `xml:"Usage,attr"`
-	Columns []xmlCol   `xml:"Column"`
+	Columns []xmlCol `xml:"Column"`
 }
 
 type xmlCol struct {
@@ -82,7 +82,7 @@ type xmlCol struct {
 
 type xmlWarnings struct {
 	ColumnsNoStats []xmlColNoStats `xml:"ColumnsWithNoStatistics>ColumnReference"`
-	SpillToTempDb  []xmlSpill      `xml:"SpillToTempDb"`
+	SpillToTempDb  []struct{}      `xml:"SpillToTempDb"`
 }
 
 type xmlColNoStats struct {
@@ -90,18 +90,14 @@ type xmlColNoStats struct {
 	Column string `xml:"Column,attr"`
 }
 
-type xmlSpill struct {
-	SpillLevel int `xml:"SpillLevel,attr"`
-}
-
+// xmlRelOp captures attributes + raw inner XML for recursive child extraction
 type xmlRelOp struct {
-	NodeID        int       `xml:"NodeId,attr"`
-	PhysicalOp    string    `xml:"PhysicalOp,attr"`
-	LogicalOp     string    `xml:"LogicalOp,attr"`
-	SubtreeCost   float64   `xml:"EstimatedTotalSubtreeCost,attr"`
-	EstimatedRows float64   `xml:"EstimatedRows,attr"`
-	// Children can be nested inside operator-specific elements; we collect all RelOp descendants
-	InnerRelOps []xmlRelOp `xml:",any>RelOp"`
+	NodeID      int     `xml:"NodeId,attr"`
+	PhysicalOp  string  `xml:"PhysicalOp,attr"`
+	LogicalOp   string  `xml:"LogicalOp,attr"`
+	SubtreeCost float64 `xml:"EstimatedTotalSubtreeCost,attr"`
+	EstRows     float64 `xml:"EstimateRows,attr"`
+	InnerXML    []byte  `xml:",innerxml"`
 }
 
 func ParseSqlPlan(path string) (*QueryPlan, error) {
@@ -120,14 +116,21 @@ func ParseSqlPlan(path string) (*QueryPlan, error) {
 	for _, batch := range root.Batches {
 		for _, stmt := range batch.Statements {
 			qp.StatementText = stmt.StatementText
-			qp.TotalCost = stmt.StatementSubCost
+			qp.TotalCost = stmt.SubTreeCost
 			qp.EstimatedRows = stmt.EstimatedRows
 
 			if stmt.QueryPlan != nil {
-				// Missing indexes
 				for _, mig := range stmt.QueryPlan.MissingIndexes {
 					for _, mi := range mig.Indexes {
-						cols := collectColumns(mi.ColumnGroups)
+						cols := ""
+						for _, cg := range mi.ColumnGroups {
+							for i, c := range cg.Columns {
+								if i > 0 {
+									cols += ", "
+								}
+								cols += c.Name
+							}
+						}
 						qp.MissingIndexes = append(qp.MissingIndexes, MissingIndex{
 							Database: mi.Database,
 							Table:    mi.Table,
@@ -137,7 +140,6 @@ func ParseSqlPlan(path string) (*QueryPlan, error) {
 					}
 				}
 
-				// Warnings
 				if w := stmt.QueryPlan.Warnings; w != nil {
 					for _, c := range w.ColumnsNoStats {
 						qp.Warnings = append(qp.Warnings, Warning{
@@ -149,12 +151,10 @@ func ParseSqlPlan(path string) (*QueryPlan, error) {
 					}
 				}
 
-				// Plan tree
 				if stmt.QueryPlan.RelOp != nil {
 					qp.RootOp = convertRelOp(stmt.QueryPlan.RelOp, qp.TotalCost)
 				}
 			}
-			// Only first statement
 			return qp, nil
 		}
 	}
@@ -162,19 +162,8 @@ func ParseSqlPlan(path string) (*QueryPlan, error) {
 	return qp, nil
 }
 
-func collectColumns(groups []xmlColGroup) string {
-	result := ""
-	for _, g := range groups {
-		for i, c := range g.Columns {
-			if i > 0 {
-				result += ", "
-			}
-			result += c.Name
-		}
-	}
-	return result
-}
-
+// convertRelOp converts xmlRelOp to RelOp, recursively finding child RelOps
+// in the innerXML regardless of wrapper element names.
 func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 	if x == nil {
 		return nil
@@ -184,16 +173,63 @@ func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
 		PhysicalOp:    x.PhysicalOp,
 		LogicalOp:     x.LogicalOp,
 		EstimatedCost: x.SubtreeCost,
-		EstimatedRows: x.EstimatedRows,
+		EstimatedRows: x.EstRows,
 	}
 	if totalCost > 0 {
 		op.CostPercent = x.SubtreeCost / totalCost * 100
 	}
-	for i := range x.InnerRelOps {
-		child := convertRelOp(&x.InnerRelOps[i], totalCost)
+
+	// Find all direct <RelOp> children anywhere in the inner XML
+	childOps := findDirectRelOps(x.InnerXML)
+	for _, c := range childOps {
+		child := convertRelOp(c, totalCost)
 		if child != nil {
 			op.Children = append(op.Children, child)
 		}
 	}
 	return op
+}
+
+// findDirectRelOps finds <RelOp> elements that are direct children
+// of the current element's content (one level deep in wrappers).
+// We skip nested RelOps inside found RelOps.
+func findDirectRelOps(data []byte) []*xmlRelOp {
+	var result []*xmlRelOp
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	depth := 0
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "RelOp" && depth == 0 {
+				var ro xmlRelOp
+				if err := dec.DecodeElement(&ro, &t); err == nil {
+					result = append(result, &ro)
+				}
+				// Don't increment depth — DecodeElement consumed everything
+			} else {
+				depth++
+			}
+		case xml.EndElement:
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return result
+}
+
+func CountNodes(op *RelOp) int {
+	if op == nil {
+		return 0
+	}
+	n := 1
+	for _, c := range op.Children {
+		n += CountNodes(c)
+	}
+	return n
 }
