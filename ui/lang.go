@@ -20,7 +20,7 @@ func (l *Lang) Code() string {
 	return l.code
 }
 
-var strings = map[string]map[string]string{
+var translations = map[string]map[string]string{
 	"openFolder":     {"EN": "Open Folder", "ET": "Ava kaust"},
 	"openInSSMS":     {"EN": "Open in SSMS", "ET": "Ava SSMS-is"},
 	"copyPath":       {"EN": "Copy Path", "ET": "Kopeeri tee"},
@@ -39,7 +39,7 @@ var strings = map[string]map[string]string{
 }
 
 func (l *Lang) T(key string) string {
-	if m, ok := strings[key]; ok {
+	if m, ok := translations[key]; ok {
 		if s, ok2 := m[l.code]; ok2 {
 			return s
 		}

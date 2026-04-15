@@ -5,7 +5,6 @@ import (
 	"os/exec"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
@@ -80,6 +79,6 @@ func OpenInSSMS(path string, w fyne.Window, lang *Lang) {
 	_ = exec.Command(ssmsPath, path).Start()
 }
 
-func CopyPathToClipboard(path string, a app.App) {
+func CopyPathToClipboard(path string, a fyne.App) {
 	a.Clipboard().SetContent(path)
 }
