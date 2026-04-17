@@ -4,6 +4,8 @@ A lightweight, fast SQL Server execution plan viewer for Windows — single exe,
 
 Designed for quickly browsing large collections of plan files, similar to how IrfanView flips through images.
 
+**[Download latest release](https://github.com/ARohtsalu/SQLPlanViewer/releases/latest/download/sqlplanviewer.exe)**
+
 ---
 
 ## Features
