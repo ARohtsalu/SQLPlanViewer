@@ -21,3 +21,18 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# Internal working documents — kept locally, not for the repo
+CHANGELOG.md
+project.txt
+settings.json
+update*.md
+updates_all.md
+sql_plan_viewer_project.md
+
+# Reference source and test files
+Erik_lahendus_päringu kuvamiseks/
+test_failid/
+
+# Claude session files
+.claude/
