@@ -135,16 +135,6 @@ type xmlRelOp struct {
 	InnerXML    []byte  `xml:",innerxml"`
 }
 
-// xmlObject represents <Object ...> child element inside a RelOp
-type xmlObject struct {
-	Database  string `xml:"Database,attr"`
-	Schema    string `xml:"Schema,attr"`
-	Table     string `xml:"Table,attr"`
-	Index     string `xml:"Index,attr"`
-	IndexKind string `xml:"IndexKind,attr"`
-	Storage   string `xml:"Storage,attr"`
-}
-
 // xmlWarningNode represents <Warnings> inside a RelOp
 type xmlWarningNode struct {
 	ColumnsNoStats []struct {
@@ -156,11 +146,6 @@ type xmlWarningNode struct {
 		SpillType  string `xml:"SpillType,attr"`
 	} `xml:"SpillToTempDb"`
 	NoJoinPredicate []struct{} `xml:"NoJoinPredicate"`
-}
-
-// xmlOutputList wraps <OutputList><ColumnReference .../> ...
-type xmlOutputList struct {
-	Columns []struct{} `xml:"ColumnReference"`
 }
 
 // ParseSqlPlan parses all statements from a .sqlplan file.
@@ -200,41 +185,39 @@ func ParseSqlPlan(path string) ([]*QueryPlan, error) {
 			}
 			idx++
 
-			if stmt.QueryPlan != nil {
-				for _, mig := range stmt.QueryPlan.MissingIndexes {
-					for _, mi := range mig.Indexes {
-						cols := ""
-						for _, cg := range mi.ColumnGroups {
-							for i, c := range cg.Columns {
-								if i > 0 {
-									cols += ", "
-								}
-								cols += c.Name
+			for _, mig := range stmt.QueryPlan.MissingIndexes {
+				for _, mi := range mig.Indexes {
+					cols := ""
+					for _, cg := range mi.ColumnGroups {
+						for i, c := range cg.Columns {
+							if i > 0 {
+								cols += ", "
 							}
+							cols += c.Name
 						}
-						qp.MissingIndexes = append(qp.MissingIndexes, MissingIndex{
-							Database: mi.Database,
-							Table:    mi.Table,
-							Columns:  cols,
-							Impact:   mig.Impact,
-						})
 					}
+					qp.MissingIndexes = append(qp.MissingIndexes, MissingIndex{
+						Database: mi.Database,
+						Table:    mi.Table,
+						Columns:  cols,
+						Impact:   mig.Impact,
+					})
 				}
+			}
 
-				if w := stmt.QueryPlan.Warnings; w != nil {
-					for _, c := range w.ColumnsNoStats {
-						qp.Warnings = append(qp.Warnings, Warning{
-							Text: "No statistics: " + c.Table + "." + c.Column,
-						})
-					}
-					for range w.SpillToTempDb {
-						qp.Warnings = append(qp.Warnings, Warning{Text: "Spill to TempDB"})
-					}
+			if w := stmt.QueryPlan.Warnings; w != nil {
+				for _, c := range w.ColumnsNoStats {
+					qp.Warnings = append(qp.Warnings, Warning{
+						Text: "No statistics: " + c.Table + "." + c.Column,
+					})
 				}
+				for range w.SpillToTempDb {
+					qp.Warnings = append(qp.Warnings, Warning{Text: "Spill to TempDB"})
+				}
+			}
 
-				if stmt.QueryPlan.RelOp != nil {
-					qp.RootOp = convertRelOp(stmt.QueryPlan.RelOp, qp.TotalCost)
-				}
+			if stmt.QueryPlan.RelOp != nil {
+				qp.RootOp = convertRelOp(stmt.QueryPlan.RelOp, qp.TotalCost)
 			}
 
 			plans = append(plans, qp)
@@ -271,14 +254,15 @@ func HasWarningsOrScans(plans []*QueryPlan) bool {
 		if len(p.Warnings) > 0 || len(p.MissingIndexes) > 0 {
 			return true
 		}
-		if countOp(p.RootOp, "Table Scan") > 0 {
+		if CountOp(p.RootOp, "Table Scan") > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-func countOp(op *RelOp, name string) int {
+// CountOp counts nodes with the given PhysicalOp name in the subtree.
+func CountOp(op *RelOp, name string) int {
 	if op == nil {
 		return 0
 	}
@@ -287,7 +271,7 @@ func countOp(op *RelOp, name string) int {
 		n = 1
 	}
 	for _, c := range op.Children {
-		n += countOp(c, name)
+		n += CountOp(c, name)
 	}
 	return n
 }

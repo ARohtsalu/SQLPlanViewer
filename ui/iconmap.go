@@ -2,6 +2,7 @@ package ui
 
 import (
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 )
@@ -152,23 +153,34 @@ func planIconName(physicalOp string) string {
 }
 
 // iconResCache caches loaded resources to avoid re-reading the embed FS.
-var iconResCache = map[string]fyne.Resource{}
+var (
+	iconResCache   = map[string]fyne.Resource{}
+	iconResCacheMu sync.RWMutex
+)
 
 // loadIconResource returns the embedded PNG resource for the given icon name.
 // Falls back to iterator_catch_all.png if not found.
 func loadIconResource(iconName string) fyne.Resource {
-	if res, ok := iconResCache[iconName]; ok {
+	iconResCacheMu.RLock()
+	res, ok := iconResCache[iconName]
+	iconResCacheMu.RUnlock()
+	if ok {
 		return res
 	}
+
 	data, err := planIconsFS.ReadFile("planicons/" + iconName + ".png")
 	if err != nil {
 		data, err = planIconsFS.ReadFile("planicons/iterator_catch_all.png")
 		if err != nil {
+			iconResCacheMu.Lock()
 			iconResCache[iconName] = nil
+			iconResCacheMu.Unlock()
 			return nil
 		}
 	}
-	res := fyne.NewStaticResource(iconName+".png", data)
-	iconResCache[iconName] = res
-	return res
+	r := fyne.NewStaticResource(iconName+".png", data)
+	iconResCacheMu.Lock()
+	iconResCache[iconName] = r
+	iconResCacheMu.Unlock()
+	return r
 }

@@ -20,19 +20,23 @@ var defaultSsmsPaths = []string{
 }
 
 type Toolbar struct {
-	container *fyne.Container
-	lang      *Lang
-	fileTree  *FileTree
-	app       fyne.App
-	win       fyne.Window
-	settings  *Settings
-	langBtn   *widget.Button
+	container  *fyne.Container
+	lang       *Lang
+	fileTree   *FileTree
+	app        fyne.App
+	win        fyne.Window
+	settings   *Settings
+	langBtn    *widget.Button
+	openBtn    *widget.Button
+	openSSMSBtn *widget.Button
+	openPSBtn  *widget.Button
+	copyBtn    *widget.Button
 }
 
 func NewToolbar(lang *Lang, ft *FileTree, a fyne.App, win fyne.Window, settings *Settings) fyne.CanvasObject {
 	tb := &Toolbar{lang: lang, fileTree: ft, app: a, win: win, settings: settings}
 
-	openBtn := widget.NewButton(lang.T("openFolder"), func() {
+	tb.openBtn = widget.NewButton(lang.T("openFolder"), func() {
 		fd := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
 			if err != nil || rc == nil {
 				return
@@ -51,7 +55,7 @@ func NewToolbar(lang *Lang, ft *FileTree, a fyne.App, win fyne.Window, settings 
 		tb.refresh()
 	})
 
-	openSSMS := widget.NewButton(lang.T("openInSSMS"), func() {
+	tb.openSSMSBtn = widget.NewButton(lang.T("openInSSMS"), func() {
 		path := ft.SelectedFile()
 		if path == "" {
 			return
@@ -59,7 +63,7 @@ func NewToolbar(lang *Lang, ft *FileTree, a fyne.App, win fyne.Window, settings 
 		tb.openInSSMS(path)
 	})
 
-	openPS := widget.NewButton(lang.T("openInPS"), func() {
+	tb.openPSBtn = widget.NewButton(lang.T("openInPS"), func() {
 		path := ft.SelectedFile()
 		if path == "" {
 			return
@@ -67,30 +71,22 @@ func NewToolbar(lang *Lang, ft *FileTree, a fyne.App, win fyne.Window, settings 
 		tb.openInPS(path)
 	})
 
-	copyPath := widget.NewButton(lang.T("copyPath"), func() {
+	tb.copyBtn = widget.NewButton(lang.T("copyPath"), func() {
 		path := ft.SelectedFile()
 		if path != "" {
 			a.Clipboard().SetContent(path)
 		}
 	})
 
-	tb.container = container.NewHBox(openBtn, tb.langBtn, openSSMS, openPS, copyPath)
+	tb.container = container.NewHBox(tb.openBtn, tb.langBtn, tb.openSSMSBtn, tb.openPSBtn, tb.copyBtn)
 	return tb.container
 }
 
 func (tb *Toolbar) refresh() {
-	if btn, ok := tb.container.Objects[0].(*widget.Button); ok {
-		btn.SetText(tb.lang.T("openFolder"))
-	}
-	if btn, ok := tb.container.Objects[2].(*widget.Button); ok {
-		btn.SetText(tb.lang.T("openInSSMS"))
-	}
-	if btn, ok := tb.container.Objects[3].(*widget.Button); ok {
-		btn.SetText(tb.lang.T("openInPS"))
-	}
-	if btn, ok := tb.container.Objects[4].(*widget.Button); ok {
-		btn.SetText(tb.lang.T("copyPath"))
-	}
+	tb.openBtn.SetText(tb.lang.T("openFolder"))
+	tb.openSSMSBtn.SetText(tb.lang.T("openInSSMS"))
+	tb.openPSBtn.SetText(tb.lang.T("openInPS"))
+	tb.copyBtn.SetText(tb.lang.T("copyPath"))
 }
 
 func (tb *Toolbar) openInSSMS(filePath string) {
@@ -175,24 +171,3 @@ func (tb *Toolbar) openInPS(filePath string) {
 	)
 }
 
-// OpenInSSMS is kept for external callers (backward compat).
-func OpenInSSMS(path string, w fyne.Window, lang *Lang) {
-	for _, p := range defaultSsmsPaths {
-		if _, err := os.Stat(p); err == nil {
-			_ = exec.Command(p, path).Start()
-			return
-		}
-	}
-	entry := widget.NewEntry()
-	entry.SetPlaceHolder(`C:\...\Ssms.exe`)
-	dialog.ShowCustomConfirm(lang.T("ssmsNotFound"), "OK", "Cancel",
-		entry, func(ok bool) {
-			if ok && entry.Text != "" {
-				_ = exec.Command(entry.Text, path).Start()
-			}
-		}, w)
-}
-
-func CopyPathToClipboard(path string, a fyne.App) {
-	a.Clipboard().SetContent(path)
-}

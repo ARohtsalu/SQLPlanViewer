@@ -184,7 +184,12 @@ func newPlanCanvas(plan *parser.QueryPlan, lang *Lang, initialScale float32, win
 }
 
 func (pc *PlanCanvas) CreateRenderer() fyne.WidgetRenderer {
-	return &planRenderer{pc: pc}
+	return &planRenderer{
+		pc:             pc,
+		staticObjects:  make([]fyne.CanvasObject, 0, 512),
+		tooltipObjects: make([]fyne.CanvasObject, 0, 64),
+		cachedScale:    -1, // force initial build
+	}
 }
 
 func (pc *PlanCanvas) FitToWindow(availW, availH float32) {
@@ -334,6 +339,17 @@ func (pc *PlanCanvas) Tapped(ev *fyne.PointEvent) {
 }
 
 func (pc *PlanCanvas) nodeAtPos(pos fyne.Position) *parser.RelOp {
+	// Fast path: check if cursor is still inside the last hovered node.
+	if pc.hoveredNode != nil {
+		n := pc.hoveredNode
+		nx := n.X*pc.Scale + pc.OffsetX
+		ny := n.Y*pc.Scale + pc.OffsetY
+		nw := nodeW * pc.Scale
+		nh := n.CachedHeight * pc.Scale
+		if pos.X >= nx && pos.X <= nx+nw && pos.Y >= ny && pos.Y <= ny+nh {
+			return n
+		}
+	}
 	for _, node := range pc.allNodes {
 		nx := node.X*pc.Scale + pc.OffsetX
 		ny := node.Y*pc.Scale + pc.OffsetY
@@ -350,8 +366,13 @@ func (pc *PlanCanvas) nodeAtPos(pos fyne.Position) *parser.RelOp {
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
 type planRenderer struct {
-	pc      *PlanCanvas
-	objects []fyne.CanvasObject
+	pc             *PlanCanvas
+	objects        []fyne.CanvasObject // combined static+tooltip; returned by Objects()
+	staticObjects  []fyne.CanvasObject // edges + nodes — only rebuilt when camera changes
+	tooltipObjects []fyne.CanvasObject // tooltip overlay — rebuilt on every hover/pin
+	cachedScale    float32
+	cachedOffX     float32
+	cachedOffY     float32
 }
 
 func (r *planRenderer) Layout(_ fyne.Size) {}
@@ -360,14 +381,29 @@ func (r *planRenderer) Destroy()           {}
 func (r *planRenderer) Objects() []fyne.CanvasObject { return r.objects }
 
 func (r *planRenderer) Refresh() {
-	r.objects = r.objects[:0] // reuse backing array, avoid GC
 	if r.pc.plan == nil || r.pc.plan.RootOp == nil {
+		r.objects = r.objects[:0]
 		canvas.Refresh(r.pc)
 		return
 	}
-	r.drawEdges(r.pc.plan.RootOp)
-	r.drawNodes(r.pc.plan.RootOp)
+	// Only rebuild edges+nodes when camera changed (zoom/pan/fit).
+	// Hover and tooltip-only updates skip this expensive path entirely.
+	cameraChanged := r.pc.Scale != r.cachedScale ||
+		r.pc.OffsetX != r.cachedOffX ||
+		r.pc.OffsetY != r.cachedOffY
+	if cameraChanged {
+		r.staticObjects = r.staticObjects[:0]
+		r.drawEdges(r.pc.plan.RootOp)
+		r.drawNodes(r.pc.plan.RootOp)
+		r.cachedScale = r.pc.Scale
+		r.cachedOffX = r.pc.OffsetX
+		r.cachedOffY = r.pc.OffsetY
+	}
+	r.tooltipObjects = r.tooltipObjects[:0]
 	r.drawTooltip()
+	r.objects = r.objects[:0]
+	r.objects = append(r.objects, r.staticObjects...)
+	r.objects = append(r.objects, r.tooltipObjects...)
 	canvas.Refresh(r.pc)
 }
 
@@ -564,14 +600,14 @@ func (r *planRenderer) drawTooltip() {
 	bord.StrokeWidth = 1
 	bord.Move(fyne.NewPos(tipX, tipY))
 	bord.Resize(fyne.NewSize(tipW, totalH))
-	r.objects = append(r.objects, bg, bord)
+	r.tooltipObjects = append(r.tooltipObjects, bg, bord)
 
 	addText := func(text string, x, y float32, col color.Color, bold bool, size float32) {
 		t := canvas.NewText(text, col)
 		t.TextStyle = fyne.TextStyle{Bold: bold}
 		t.TextSize = size
 		t.Move(fyne.NewPos(x, y))
-		r.objects = append(r.objects, t)
+		r.tooltipObjects = append(r.tooltipObjects, t)
 	}
 
 	// ── Title ────────────────────────────────────────────────────────────────
@@ -614,6 +650,13 @@ func (r *planRenderer) ty(y float32) float32 { return y*r.pc.Scale + r.pc.Offset
 // Parent right-center → midX → child left-center.
 // Thickness: log-based on estimated rows (matches Erik's formula).
 func (r *planRenderer) drawEdges(op *parser.RelOp) {
+	sz := r.pc.Size()
+	// Children are always at greater X (depth increases rightward).
+	// If this node starts past the right edge, all descendants are too.
+	if r.tx(op.X) > sz.Width {
+		return
+	}
+
 	s := r.pc.Scale
 	parentRight := r.tx(op.X + nodeW)
 	parentCenterY := r.ty(op.Y + op.CachedHeight/2)
@@ -624,34 +667,43 @@ func (r *planRenderer) drawEdges(op *parser.RelOp) {
 		childCenterY := r.ty(child.Y + ch/2)
 		midX := (parentRight + childLeft) / 2
 
-		// Log-based thickness: max(2, min(floor(log(max(1, rows))), 12))
-		rows := child.EstimatedRows
-		if rows < 1 {
-			rows = 1
+		// Skip edge if its bounding box is fully outside the viewport.
+		edgeMinY := parentCenterY
+		edgeMaxY := childCenterY
+		if edgeMinY > edgeMaxY {
+			edgeMinY, edgeMaxY = edgeMaxY, edgeMinY
 		}
-		thickness := float32(math.Max(2, math.Min(math.Floor(math.Log(rows)), 12))) * s
+		edgeVisible := parentRight < sz.Width && childLeft > 0 &&
+			edgeMinY < sz.Height && edgeMaxY > 0
+		if edgeVisible {
+			// Log-based thickness: max(2, min(floor(log(max(1, rows))), 12))
+			rows := child.EstimatedRows
+			if rows < 1 {
+				rows = 1
+			}
+			thickness := float32(math.Max(2, math.Min(math.Floor(math.Log(rows)), 12))) * s
 
-		addLine := func(x1, y1, x2, y2 float32) {
-			l := canvas.NewLine(colEdge)
-			l.StrokeWidth = thickness
-			l.Position1 = fyne.NewPos(x1, y1)
-			l.Position2 = fyne.NewPos(x2, y2)
-			r.objects = append(r.objects, l)
+			addLine := func(x1, y1, x2, y2 float32) {
+				l := canvas.NewLine(colEdge)
+				l.StrokeWidth = thickness
+				l.Position1 = fyne.NewPos(x1, y1)
+				l.Position2 = fyne.NewPos(x2, y2)
+				r.staticObjects = append(r.staticObjects, l)
+			}
+
+			// Segment 1: parent right → midX (horizontal)
+			addLine(parentRight, parentCenterY, midX, parentCenterY)
+			// Segment 2: midX, parentY → midX, childY (vertical)
+			addLine(midX, parentCenterY, midX, childCenterY)
+			// Segment 3: midX → child left (horizontal)
+			addLine(midX, childCenterY, childLeft, childCenterY)
+
+			// Arrowhead at parent connection: tip at parentRight, wings open right →
+			aLen := 6 * s
+			aHalf := 3 * s
+			addLine(parentRight, parentCenterY, parentRight+aLen, parentCenterY-aHalf)
+			addLine(parentRight, parentCenterY, parentRight+aLen, parentCenterY+aHalf)
 		}
-
-		// Segment 1: parent right → midX (horizontal)
-		addLine(parentRight, parentCenterY, midX, parentCenterY)
-		// Segment 2: midX, parentY → midX, childY (vertical)
-		addLine(midX, parentCenterY, midX, childCenterY)
-		// Segment 3: midX → child left (horizontal)
-		addLine(midX, childCenterY, childLeft, childCenterY)
-
-		// Arrowhead at parent connection: tip at parentRight, wings open right →
-		// Indicates data flows from child (right) into parent (left), SSMS convention.
-		aLen := 6 * s
-		aHalf := 3 * s
-		addLine(parentRight, parentCenterY, parentRight+aLen, parentCenterY-aHalf)
-		addLine(parentRight, parentCenterY, parentRight+aLen, parentCenterY+aHalf)
 
 		r.drawEdges(child)
 	}
@@ -664,6 +716,24 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 	y := r.ty(op.Y)
 	w := nodeW * s
 	h := op.CachedHeight * s
+
+	sz := r.pc.Size()
+	// Subtree pruning: children always have X >= op.X and Y >= op.Y (see layout invariants).
+	// If node is off-screen right, all descendants are further right — prune subtree.
+	// If node top is below viewport bottom, all descendants are further down — prune subtree.
+	if x > sz.Width || y > sz.Height {
+		return
+	}
+
+	// Draw this node only if visible (may be partially off-screen to the left or top).
+	nodeVisible := x+w > 0 && y+h > 0
+
+	if !nodeVisible {
+		for _, child := range op.Children {
+			r.drawNodes(child)
+		}
+		return
+	}
 
 	// Three-tier cost coloring
 	var tintColor, borderColor color.Color
@@ -684,7 +754,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 	bg.CornerRadius = 4 * s
 	bg.Resize(fyne.NewSize(w, h))
 	bg.Move(fyne.NewPos(x, y))
-	r.objects = append(r.objects, bg)
+	r.staticObjects = append(r.staticObjects, bg)
 
 	// Cost tint overlay (semi-transparent, blends over base)
 	if tintColor != color.Transparent {
@@ -692,7 +762,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		tint.CornerRadius = 4 * s
 		tint.Resize(fyne.NewSize(w, h))
 		tint.Move(fyne.NewPos(x, y))
-		r.objects = append(r.objects, tint)
+		r.staticObjects = append(r.staticObjects, tint)
 	}
 
 	// Border
@@ -703,7 +773,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 	bord.Resize(fyne.NewSize(w, h))
 	bord.Move(fyne.NewPos(x, y))
 
-	r.objects = append(r.objects, bord)
+	r.staticObjects = append(r.staticObjects, bord)
 
 	// Icon (32x32, centered horizontally, 4px top margin)
 	iconSize := float32(32) * s
@@ -715,7 +785,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		img.FillMode = canvas.ImageFillContain
 		img.Resize(fyne.NewSize(iconSize, iconSize))
 		img.Move(fyne.NewPos(iconX, iconY))
-		r.objects = append(r.objects, img)
+		r.staticObjects = append(r.staticObjects, img)
 	}
 
 	// Warning badge — always visible (important signal even when zoomed out).
@@ -728,7 +798,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		badge := canvas.NewText("⚠", color.RGBA{R: 0xFF, G: 0xA5, B: 0x00, A: 255})
 		badge.TextSize = badgeSize
 		badge.Move(fyne.NewPos(x+w-16*s, y+4*s))
-		r.objects = append(r.objects, badge)
+		r.staticObjects = append(r.staticObjects, badge)
 	}
 
 	// Parallel badge — same clamped sizing.
@@ -740,7 +810,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		par := canvas.NewText("⇆", color.RGBA{R: 0xFF, G: 0xC1, B: 0x07, A: 255})
 		par.TextSize = parSize
 		par.Move(fyne.NewPos(x+w-28*s, y+4*s))
-		r.objects = append(r.objects, par)
+		r.staticObjects = append(r.staticObjects, par)
 	}
 
 	// Text labels: only rendered when zoomed in enough to be legible.
@@ -763,7 +833,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		opName.TextSize = nameSize
 		opName.TextStyle = fyne.TextStyle{Bold: true}
 		opName.Move(fyne.NewPos(x+8*s, nameY))
-		r.objects = append(r.objects, opName)
+		r.staticObjects = append(r.staticObjects, opName)
 
 		// Cost% row
 		costY := nameY + line10*s
@@ -779,14 +849,14 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 		costTxt := canvas.NewText(fmt.Sprintf("Cost: %d%%", int(op.CostPercent)), costColor)
 		costTxt.TextSize = nameSize
 		costTxt.Move(fyne.NewPos(x+8*s, costY))
-		r.objects = append(r.objects, costTxt)
+		r.staticObjects = append(r.staticObjects, costTxt)
 
 		// Est rows
 		rowsY := costY + line10*s
 		rowsTxt := canvas.NewText(fmt.Sprintf("Rows: %s", formatRows(op.EstimatedRows)), colText)
 		rowsTxt.TextSize = smallSize
 		rowsTxt.Move(fyne.NewPos(x+8*s, rowsY))
-		r.objects = append(r.objects, rowsTxt)
+		r.staticObjects = append(r.staticObjects, rowsTxt)
 
 		// Object name — schema.table or schema.table.index (one line, truncated)
 		if op.ObjTable != "" {
@@ -803,7 +873,7 @@ func (r *planRenderer) drawNodes(op *parser.RelOp) {
 			objLabel := canvas.NewText(objText, colText)
 			objLabel.TextSize = smallSize
 			objLabel.Move(fyne.NewPos(x+8*s, objY))
-			r.objects = append(r.objects, objLabel)
+			r.staticObjects = append(r.staticObjects, objLabel)
 		}
 	}
 

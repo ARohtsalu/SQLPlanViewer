@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -13,7 +14,9 @@ import (
 type FileTree struct {
 	lang          *Lang
 	list          *widget.List
+	mu            sync.RWMutex
 	files         []string
+	loadID        int // incremented on each LoadFolder call; goroutine aborts if stale
 	currentFolder string
 	selectedIndex int
 	OnFileSelected func(path string)
@@ -27,21 +30,37 @@ func NewFileTree(lang *Lang) *FileTree {
 	}
 
 	ft.list = widget.NewList(
-		func() int { return len(ft.files) },
+		func() int {
+			ft.mu.RLock()
+			n := len(ft.files)
+			ft.mu.RUnlock()
+			return n
+		},
 		func() fyne.CanvasObject {
 			return widget.NewLabel("template")
 		},
 		func(i widget.ListItemID, obj fyne.CanvasObject) {
-			label := obj.(*widget.Label)
-			label.SetText(ft.fileLabel(ft.files[i]))
+			ft.mu.RLock()
+			if i >= len(ft.files) {
+				ft.mu.RUnlock()
+				return
+			}
+			path := ft.files[i]
+			ft.mu.RUnlock()
+			obj.(*widget.Label).SetText(ft.fileLabel(path))
 		},
 	)
 
 	ft.list.OnSelected = func(id widget.ListItemID) {
 		ft.selectedIndex = id
+		ft.mu.RLock()
 		if ft.OnFileSelected != nil && id < len(ft.files) {
-			ft.OnFileSelected(ft.files[id])
+			path := ft.files[id]
+			ft.mu.RUnlock()
+			ft.OnFileSelected(path)
+			return
 		}
+		ft.mu.RUnlock()
 	}
 
 	ft.scroll = container.NewScroll(ft.list)
@@ -60,41 +79,101 @@ func (ft *FileTree) fileLabel(path string) string {
 }
 
 func (ft *FileTree) LoadFolder(dir string) {
+	ft.mu.Lock()
+	ft.loadID++
+	myID := ft.loadID
 	ft.currentFolder = dir
 	ft.files = nil
 	ft.selectedIndex = -1
-	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".sqlplan" || ext == ".xdl" {
-			ft.files = append(ft.files, path)
-		}
-		return nil
-	})
+	ft.mu.Unlock()
+
 	ft.list.Refresh()
+
+	go func() {
+		var collected []string
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".sqlplan" || ext == ".xdl" {
+				collected = append(collected, path)
+			}
+			return nil
+		})
+
+		ft.mu.Lock()
+		if ft.loadID == myID { // discard result if a newer LoadFolder already started
+			ft.files = collected
+		}
+		ft.mu.Unlock()
+		ft.list.Refresh()
+	}()
 }
 
 // LoadFolderAndSelect loads the folder and immediately selects the given file.
+// Because loading is async, selection happens after the walk completes.
 func (ft *FileTree) LoadFolderAndSelect(dir, filePath string) {
-	ft.LoadFolder(dir)
-	for i, f := range ft.files {
-		if f == filePath {
-			ft.list.Select(i)
-			ft.list.ScrollTo(i)
+	ft.mu.Lock()
+	ft.loadID++
+	myID := ft.loadID
+	ft.currentFolder = dir
+	ft.files = nil
+	ft.selectedIndex = -1
+	ft.mu.Unlock()
+
+	ft.list.Refresh()
+
+	go func() {
+		var collected []string
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".sqlplan" || ext == ".xdl" {
+				collected = append(collected, path)
+			}
+			return nil
+		})
+
+		ft.mu.Lock()
+		if ft.loadID != myID {
+			ft.mu.Unlock()
 			return
 		}
-	}
+		ft.files = collected
+		ft.mu.Unlock()
+
+		ft.list.Refresh()
+
+		ft.mu.RLock()
+		idx := -1
+		for i, f := range ft.files {
+			if f == filePath {
+				idx = i
+				break
+			}
+		}
+		ft.mu.RUnlock()
+
+		if idx >= 0 {
+			ft.list.Select(idx)
+			ft.list.ScrollTo(idx)
+		}
+	}()
 }
 
 func (ft *FileTree) SelectNext() {
-	if len(ft.files) == 0 {
+	ft.mu.RLock()
+	n := len(ft.files)
+	ft.mu.RUnlock()
+	if n == 0 {
 		return
 	}
 	next := ft.selectedIndex + 1
-	if next >= len(ft.files) {
-		next = len(ft.files) - 1
+	if next >= n {
+		next = n - 1
 	}
 	if next != ft.selectedIndex {
 		ft.list.Select(next)
@@ -102,19 +181,15 @@ func (ft *FileTree) SelectNext() {
 }
 
 func (ft *FileTree) SelectPrevious() {
-	if len(ft.files) == 0 {
+	if ft.selectedIndex <= 0 {
 		return
 	}
-	prev := ft.selectedIndex - 1
-	if prev < 0 {
-		prev = 0
-	}
-	if prev != ft.selectedIndex {
-		ft.list.Select(prev)
-	}
+	ft.list.Select(ft.selectedIndex - 1)
 }
 
 func (ft *FileTree) SelectedFile() string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
 	if ft.selectedIndex < 0 || ft.selectedIndex >= len(ft.files) {
 		return ""
 	}
@@ -126,7 +201,10 @@ func (ft *FileTree) SelectedIndex() int {
 }
 
 func (ft *FileTree) Count() int {
-	return len(ft.files)
+	ft.mu.RLock()
+	n := len(ft.files)
+	ft.mu.RUnlock()
+	return n
 }
 
 func (ft *FileTree) CurrentFolder() string {

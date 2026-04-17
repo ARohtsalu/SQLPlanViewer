@@ -181,7 +181,7 @@ func (pv *PlanView) buildPlanTab(plan *parser.QueryPlan, batchTotal float64) fyn
 	for _, w := range plan.Warnings {
 		alerts = append(alerts, widget.NewLabel("⚠ "+w.Text))
 	}
-	scans := countOpType(plan.RootOp, "Table Scan")
+	scans := parser.CountOp(plan.RootOp, "Table Scan")
 	if scans > 0 {
 		alerts = append(alerts, widget.NewLabel(
 			fmt.Sprintf("🔴 %s: %d", pv.lang.T("tableScan"), scans)))
@@ -214,19 +214,6 @@ func (pv *PlanView) buildDeadlockView(path string) fyne.CanvasObject {
 	return vsplit
 }
 
-func countOpType(op *parser.RelOp, name string) int {
-	if op == nil {
-		return 0
-	}
-	n := 0
-	if op.PhysicalOp == name {
-		n = 1
-	}
-	for _, c := range op.Children {
-		n += countOpType(c, name)
-	}
-	return n
-}
 
 func (pv *PlanView) Widget() fyne.CanvasObject {
 	return pv.wrapper
