@@ -32,6 +32,8 @@ var translations = map[string]map[string]string{
 	"estRows":        {"EN": "Est. Rows", "ET": "Hinnangulised read"},
 	"noFile":         {"EN": "Select a file from the left panel", "ET": "Vali fail vasakust paneelist"},
 	"ssmsNotFound":   {"EN": "SSMS not found. Enter path:", "ET": "SSMS-i ei leitud. Sisesta tee:"},
+	"openInPS":       {"EN": "Open in Performance Studio", "ET": "Ava Performance Studios"},
+	"psNotFound":     {"EN": "Performance Studio not found. Enter path to PlanViewer.App.exe:", "ET": "Performance Studio-t ei leitud. Sisesta tee PlanViewer.App.exe-ni:"},
 	"deadlockVictim": {"EN": "Deadlock Victim", "ET": "Ummiku ohver"},
 	"processes":      {"EN": "Processes", "ET": "Protsessid"},
 	"resources":      {"EN": "Resources", "ET": "Ressursid"},

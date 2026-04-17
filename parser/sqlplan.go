@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/xml"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type QueryPlan struct {
@@ -24,7 +26,31 @@ type RelOp struct {
 	EstimatedRows float64
 	CostPercent   float64
 	X, Y          float32
+	CachedHeight  float32 // set by UI layout, avoids repeated calculation
 	Children      []*RelOp
+
+	// Extended tooltip fields
+	EstRowsRead      float64
+	EstimateIO       float64
+	EstimateCPU      float64
+	AvgRowSize       float64
+	TableCardinality float64
+	Parallel         bool
+	EstRebinds       float64
+	EstRewinds       float64
+	ExecutionMode    string
+	ObjDatabase      string
+	ObjSchema        string
+	ObjTable         string
+	ObjIndex         string
+	ObjIndexKind     string
+	ObjStorage       string
+	OutputColumns    int
+	OutputColNames   []string // output column reference names
+	Predicate        string   // residual predicate expression (ScalarString)
+	SeekPredicate    string   // seek predicate expression (ScalarString)
+	HasWarnings      bool
+	WarningTexts     []string
 }
 
 type MissingIndex struct {
@@ -97,7 +123,44 @@ type xmlRelOp struct {
 	LogicalOp   string  `xml:"LogicalOp,attr"`
 	SubtreeCost float64 `xml:"EstimatedTotalSubtreeCost,attr"`
 	EstRows     float64 `xml:"EstimateRows,attr"`
+	EstRowsRead float64 `xml:"EstimatedRowsRead,attr"`
+	EstimateIO  float64 `xml:"EstimateIO,attr"`
+	EstimateCPU float64 `xml:"EstimateCPU,attr"`
+	AvgRowSize  float64 `xml:"AvgRowSize,attr"`
+	TableCard   float64 `xml:"TableCardinality,attr"`
+	ParallelStr string  `xml:"Parallel,attr"`
+	EstRebinds  float64 `xml:"EstimateRebinds,attr"`
+	EstRewinds  float64 `xml:"EstimateRewinds,attr"`
+	ExecMode    string  `xml:"EstimatedExecutionMode,attr"`
 	InnerXML    []byte  `xml:",innerxml"`
+}
+
+// xmlObject represents <Object ...> child element inside a RelOp
+type xmlObject struct {
+	Database  string `xml:"Database,attr"`
+	Schema    string `xml:"Schema,attr"`
+	Table     string `xml:"Table,attr"`
+	Index     string `xml:"Index,attr"`
+	IndexKind string `xml:"IndexKind,attr"`
+	Storage   string `xml:"Storage,attr"`
+}
+
+// xmlWarningNode represents <Warnings> inside a RelOp
+type xmlWarningNode struct {
+	ColumnsNoStats []struct {
+		Table  string `xml:"Table,attr"`
+		Column string `xml:"Column,attr"`
+	} `xml:"ColumnsWithNoStatistics>ColumnReference"`
+	SpillToTempDb []struct {
+		SpillLevel int    `xml:"SpillLevel,attr"`
+		SpillType  string `xml:"SpillType,attr"`
+	} `xml:"SpillToTempDb"`
+	NoJoinPredicate []struct{} `xml:"NoJoinPredicate"`
+}
+
+// xmlOutputList wraps <OutputList><ColumnReference .../> ...
+type xmlOutputList struct {
+	Columns []struct{} `xml:"ColumnReference"`
 }
 
 // ParseSqlPlan parses all statements from a .sqlplan file.
@@ -123,6 +186,12 @@ func ParseSqlPlan(path string) ([]*QueryPlan, error) {
 
 	for _, batch := range root.Batches {
 		for _, stmt := range batch.Statements {
+			// Skip DDL/SET/DECLARE wrappers that have no QueryPlan element —
+			// they carry no execution plan and only add noise to the tab list.
+			if stmt.QueryPlan == nil {
+				continue
+			}
+
 			qp := &QueryPlan{
 				StatementIndex: idx,
 				StatementText:  stmt.StatementText,
@@ -168,7 +237,6 @@ func ParseSqlPlan(path string) ([]*QueryPlan, error) {
 				}
 			}
 
-			// Include all statements (even DDL/SET with no RelOp) so tabs are complete
 			plans = append(plans, qp)
 		}
 	}
@@ -224,40 +292,42 @@ func countOp(op *RelOp, name string) int {
 	return n
 }
 
-func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
-	if x == nil {
-		return nil
-	}
-	op := &RelOp{
-		NodeID:        x.NodeID,
-		PhysicalOp:    x.PhysicalOp,
-		LogicalOp:     x.LogicalOp,
-		EstimatedCost: x.SubtreeCost,
-		EstimatedRows: x.EstRows,
-	}
-	if totalCost > 0 {
-		op.CostPercent = x.SubtreeCost / totalCost * 100
-	}
-	for _, c := range findDirectRelOps(x.InnerXML) {
-		if child := convertRelOp(c, totalCost); child != nil {
-			op.Children = append(op.Children, child)
+// extractFirstScalarString walks the tokens inside an already-started XML element
+// and returns the ScalarString attribute of the first ScalarOperator found.
+// Consumes all tokens up to and including the matching end element.
+func extractFirstScalarString(dec *xml.Decoder, _ xml.StartElement) string {
+	var result string
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch tok := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if tok.Name.Local == "ScalarOperator" && result == "" {
+				for _, a := range tok.Attr {
+					if a.Name.Local == "ScalarString" {
+						result = a.Value
+					}
+				}
+			}
+		case xml.EndElement:
+			depth--
 		}
 	}
-	return op
+	return result
 }
 
-// findDirectRelOps finds all direct-child <RelOp> elements within xmlData,
-// regardless of how many wrapper elements (e.g. <NestedLoops>, <Hash>) they
-// are nested inside. Because xml.Decoder.DecodeElement consumes the entire
-// subtree of each found RelOp, deeper RelOps are not visited a second time —
-// so we naturally get only the "shallowest" RelOp in each branch.
-func findDirectRelOps(data []byte) []*xmlRelOp {
-	data = bytes.ReplaceAll(data,
-		[]byte(`xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"`),
-		[]byte(""))
-
-	var result []*xmlRelOp
-	dec := xml.NewDecoder(bytes.NewReader(data))
+// parseRelOpInnerXML does a single pass over the InnerXML of a RelOp:
+// - Extracts Object, OutputList, and Warnings info into op
+// - Collects and returns direct-child RelOp elements
+// DecodeElement on child <RelOp> elements consumes their full subtrees,
+// so nested Object/Warnings are not double-counted.
+func parseRelOpInnerXML(op *RelOp, innerXML []byte) []*xmlRelOp {
+	dec := xml.NewDecoder(bytes.NewReader(innerXML))
+	var children []*xmlRelOp
 
 	for {
 		tok, err := dec.Token()
@@ -268,18 +338,124 @@ func findDirectRelOps(data []byte) []*xmlRelOp {
 		if !ok {
 			continue
 		}
-		if t.Name.Local == "RelOp" {
-			// DecodeElement reads everything up to the matching </RelOp>,
-			// including any nested RelOp subtrees — so they won't be seen again.
+		switch t.Name.Local {
+		case "RelOp":
 			var ro xmlRelOp
 			if err := dec.DecodeElement(&ro, &t); err == nil {
-				result = append(result, &ro)
+				children = append(children, &ro)
+			}
+		case "Object":
+			for _, attr := range t.Attr {
+				switch attr.Name.Local {
+				case "Database":
+					op.ObjDatabase = strings.Trim(attr.Value, "[]")
+				case "Schema":
+					op.ObjSchema = strings.Trim(attr.Value, "[]")
+				case "Table":
+					op.ObjTable = strings.Trim(attr.Value, "[]")
+				case "Index":
+					op.ObjIndex = strings.Trim(attr.Value, "[]")
+				case "IndexKind":
+					op.ObjIndexKind = attr.Value
+				case "Storage":
+					op.ObjStorage = attr.Value
+				}
+			}
+		case "OutputList":
+			var cols []string
+			depth := 1
+			for depth > 0 {
+				inner, ierr := dec.Token()
+				if ierr != nil {
+					break
+				}
+				switch tok := inner.(type) {
+				case xml.StartElement:
+					depth++
+					if tok.Name.Local == "ColumnReference" {
+						for _, a := range tok.Attr {
+							if a.Name.Local == "Column" {
+								cols = append(cols, strings.Trim(a.Value, "[]"))
+							}
+						}
+					}
+				case xml.EndElement:
+					depth--
+				}
+			}
+			op.OutputColumns = len(cols)
+			op.OutputColNames = cols
+		case "Predicate":
+			if op.Predicate == "" {
+				op.Predicate = extractFirstScalarString(dec, t)
+			}
+		case "SeekPredicates":
+			if op.SeekPredicate == "" {
+				op.SeekPredicate = extractFirstScalarString(dec, t)
+			}
+		case "Warnings":
+			var warn xmlWarningNode
+			if err2 := dec.DecodeElement(&warn, &t); err2 == nil {
+				if len(warn.ColumnsNoStats) > 0 || len(warn.SpillToTempDb) > 0 || len(warn.NoJoinPredicate) > 0 {
+					op.HasWarnings = true
+				}
+				for _, c := range warn.ColumnsNoStats {
+					op.WarningTexts = append(op.WarningTexts, "No stats: "+c.Table+"."+c.Column)
+				}
+				for _, sp := range warn.SpillToTempDb {
+					op.WarningTexts = append(op.WarningTexts, "Spill to TempDB (level "+strconv.Itoa(sp.SpillLevel)+")")
+					op.HasWarnings = true
+				}
+				for range warn.NoJoinPredicate {
+					op.WarningTexts = append(op.WarningTexts, "No join predicate")
+					op.HasWarnings = true
+				}
 			}
 		}
-		// Non-RelOp start elements are intentionally skipped;
-		// their tokens will still be consumed in order by future Token() calls.
 	}
-	return result
+	return children
+}
+
+func convertRelOp(x *xmlRelOp, totalCost float64) *RelOp {
+	if x == nil {
+		return nil
+	}
+	op := &RelOp{
+		NodeID:        x.NodeID,
+		PhysicalOp:    x.PhysicalOp,
+		LogicalOp:     x.LogicalOp,
+		EstimatedCost: x.SubtreeCost,
+		EstimatedRows: x.EstRows,
+		EstRowsRead:   x.EstRowsRead,
+		EstimateIO:    x.EstimateIO,
+		EstimateCPU:   x.EstimateCPU,
+		AvgRowSize:    x.AvgRowSize,
+		TableCardinality: x.TableCard,
+		EstRebinds:    x.EstRebinds,
+		EstRewinds:    x.EstRewinds,
+		ExecutionMode: x.ExecMode,
+	}
+	if x.ParallelStr == "1" || x.ParallelStr == "true" {
+		op.Parallel = true
+	}
+	if totalCost > 0 {
+		// Use the operator's own cost (IO + CPU), not the subtree cost.
+		// SubtreeCost is cumulative (includes all descendants), which makes every
+		// non-leaf node look expensive and the root always 100%.
+		op.CostPercent = (x.EstimateIO + x.EstimateCPU) / totalCost * 100
+	}
+
+	// Single pass: extract extras AND find child RelOps at once
+	var childXMLOps []*xmlRelOp
+	if len(x.InnerXML) > 0 {
+		childXMLOps = parseRelOpInnerXML(op, x.InnerXML)
+	}
+	for _, c := range childXMLOps {
+		if child := convertRelOp(c, totalCost); child != nil {
+			op.Children = append(op.Children, child)
+		}
+	}
+	return op
 }
 
 func CountNodes(op *RelOp) int {
