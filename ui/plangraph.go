@@ -204,12 +204,10 @@ func (pc *PlanCanvas) FitToWindow(availW, availH float32) {
 	if pc.Scale < 0.15 {
 		pc.Scale = 0.15
 	}
-	// Interactive canvas: allow zoom beyond 1.0 so small plans fill the window.
-	// Mini preview canvas (Interactive=false): keep native scale, never zoom in.
-	maxScale := float32(3.0)
-	if !pc.Interactive {
-		maxScale = 1.0
-	}
+	// Cap auto-fit at 1.0 so small plans are not blown up to fill the window.
+	// The user can zoom in manually with scroll or the + button.
+	// Mini preview canvas stays at 1.0 too.
+	maxScale := float32(1.0)
 	if pc.Scale > maxScale {
 		pc.Scale = maxScale
 	}
