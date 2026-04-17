@@ -77,4 +77,8 @@ settings.json (salvestatakse %APPDATA%\sqlplanviewer\):
 ## Projekt
 
 Kirjutatud Go + Fyne v2 (https://fyne.io/).
-Inspireeritud Erik Darlingi Performance Studio visuaalist ja SSMS-i plaanivaatajast.
+
+Suur tänu Erik Darlingile (https://github.com/erikdarlingdata) Performance Studio eest —
+visuaalne kujundus, sõlmede paigutus ja operaatoriikoonid on otseselt inspireeritud tema tööst.
+Kui vajad täisfunktsionaalset plaanivaatajat, kasuta tema tööriista:
+https://github.com/erikdarlingdata/PerformanceStudio

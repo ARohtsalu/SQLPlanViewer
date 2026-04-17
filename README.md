@@ -80,5 +80,6 @@ Produces a single `sqlplanviewer.exe` with no external dependencies.
 
 ## About
 
-Built with Go + [Fyne v2](https://fyne.io/).  
-Inspired by [Erik Darling's Performance Studio](https://github.com/erikdarlingdata/PerformanceStudio) and SSMS plan viewer.
+Built with Go + [Fyne v2](https://fyne.io/).
+
+Special thanks to [Erik Darling](https://github.com/erikdarlingdata) for [Performance Studio](https://github.com/erikdarlingdata/PerformanceStudio) — the visual design, node layout, and operator icon set are directly inspired by his work. If you need a full-featured plan viewer, use his tool.
